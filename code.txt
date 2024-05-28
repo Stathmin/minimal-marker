@@ -1,0 +1,141 @@
+###==> parallel_run_indexing.sh ⇐
+
+# Activate the Blaster environment
+source path_to/anaconda3/bin/activate path_to/anaconda3/envs/blaster
+
+# Find and process genomic.fna.gz files
+find path_to/genomes/human_readable/genbank/plant/Hordeum/vulgare -name *genomic.fna.gz | grep -Po "GCA.*?.\.\d" | sort | uniq | parallel -j 10 bash ./single_index_for_dicey.sh
+
+###==> single_index_for_dicey.sh <==
+
+# Activate the Blaster environment
+source path_to/anaconda3/bin/activate path_to/anaconda3/envs/blaster
+
+# Define the assembly
+assembly="$1"
+echo ${assembly} started >> nohup.out
+
+# Extract relevant chromosomes from genomic.fna.gz
+zcat -c path_to/genbank/plant/${assembly}/*genomic.fna.gz | seqkit grep -r -n -p "chr" | sed "s/>.*\[\(.*\)\]/>\1/" | sed "s/ /_/g" | sed "s/^\n//g" | seqkit rename -n > ${assembly}_chromosomes_difflen.fasta
+
+# Reformat and rename the chromosomes
+seqkit seq -j 20 -g -w 70 ${assembly}_chromosomes_difflen.fasta > ${assembly}_chromosomes.fasta
+rm ${assembly}_chromosomes_difflen.fasta
+
+# Compress the reformatted chromosomes
+bgzip -@ 20 ${assembly}_chromosomes.fasta
+
+# Create a Dicey index for the compressed chromosomes
+dicey index -o ${assembly}_chromosomes.fasta.fm9 ${assembly}_chromosomes.fasta.gz
+
+# Generate an index for the chromosomes
+samtools faidx ${assembly}_chromosomes.fasta.gz
+
+# Move the generated files to dicey_indexes directory
+mv ${assembly}_* ./dicey_indexes
+
+echo ${assembly} chromosomes selected >> nohup.out
+
+###==> jsoner.R <==
+
+library(tidyverse)  # Load required packages
+library(jsonlite)
+library(caret)
+library(FeatureTerminatoR)
+
+# Parse and combine JSON results
+all_results_table <- Sys.glob('dicey_results/*.json') %>%
+  purrr::map_dfr(~ jsonlite::fromJSON(.x, simplifyDataFrame = T, flatten = F)$data$amplicons %>%
+                as_tibble() %>%
+                mutate(source_file = .x))
+
+# Generate a column to store formatted information
+all_results_table %>%
+  mutate(Pasta = glue::glue("{Chrom} {ForPos}-{ForEnd} {Length} bp {Seq}")) %>%
+  select(source_file, Length, Pasta) %>%
+  mutate(
+    # Extract primer and chromosome names
+    primers = stringi::stri_match_first_regex(source_file, '\\w+_primers') %>% c(),
+    chromosomes = stringi::stri_match_first_regex(source_file, '[a-zA-Z]+_\\d+_chromosomes') %>% c()
+  ) %>%
+  select(primers, chromosomes, Length, Pasta) %>%
+  group_by(primers, chromosomes) %>%
+  ungroup() -> processed_result
+
+# Write processed results to a CSV file
+processed_result %>% write.csv('markers.csv')
+
+# Pivot table to generate a dataset with chromosomes as columns and primer lengths as values
+processed_result %>%
+  select(-Pasta) %>%
+  pivot_wider(id_cols = chromosomes, names_from = primers, values_from = Length) %>%
+  janitor::clean_names() %>%
+  janitor::remove_constant() %>%
+  janitor::remove_empty(which = 'cols', cutoff = 0.999) %>%
+  distinct_at(vars(-chromosomes), .keep_all = TRUE) -> dataset
+
+# Pivot table to generate a dataset with chromosomes as columns and primer descriptions as values
+processed_result %>%
+  select(-Length) %>%
+  pivot_wider(names_from = primers, values_from = Pasta) %>%
+  janitor::clean_names() %>%
+  janitor::remove_constant() %>%
+  janitor::remove_empty(which = 'cols', cutoff = 0.999) %>%
+  distinct_at(vars(-chromosomes), .keep_all = TRUE) -> dataset_description
+
+# Convert dataset to a dataframe and assign chromosome numbers
+df <- dataset %>% mutate(chromosomes = 1:n()) %>% as.data.frame
+
+df <- dataset %>% mutate(chromosomes = forcats::as_factor(chromosomes)) %>% as.data.frame
+
+# Perform feature selection using FeatureTerminatoR package
+rfe_fit <- rfeTerminator(df, y_cols = 1, x_cols = 2:ncol(df),
+                        alter_df = TRUE, eval_funcs = rfFuncs, ntree = 1000)
+
+# Print results of optimal model and selected variables
+print(rfe_fit$rfe_model_fit_results)
+print(rfe_fit$rfe_model_fit_results$optVariables)
+
+# Print original and reduced data
+print(head(rfe_fit$rfe_original_data))
+print(head(rfe_fit$rfe_reduced_data))
+
+# Produce .csv results file
+sel_columns <- c('chromosomes',rfe_fit$rfe_reduced_data %>% colnames())
+dataset %>% select(all_of(sel_columns)) %>%
+  write.csv('reduced.markers_lengths.csv')
+dataset_descrtiption %>% select(all_of(sel_columns)) %>%
+  write.csv('reduced.markers_lengths_explained.csv')
+
+###==> main.R <==
+set.seed(42)  # Set random seed for reproducibility
+
+renv::activate()  # Activate the project environment
+library('tidyverse')  # Load required packages
+library('furrr')
+
+no_cores <- round((availableCores() + 4) / 4)  # Determine the number of CPU cores to use
+plan(multicore, workers = no_cores)  # Set parallel processing plan
+
+in_silico_pcr <- function(name, txt) {
+  # Execute command to generate primerfasta file
+  system(glue::glue("echo '{txt}' > ./dicey_results/{name}.primerfasta"))
+ 
+  # Perform in silico PCR using dicey search
+  furrr::future_walk(Sys.glob('./dicey_indexes/*.gz'), ~system(glue::glue("dicey search -k 10 -m 99999999 -l 800 -i ~/git/dicey/src/primer3_config -g {.x} ./dicey_results/{name}.primerfasta > ./dicey_results/{name}_primers_{.x %>% stringr::str_extract('GCA_[0-9]+')}_chromosomes.json")))
+}
+
+assemblies <- Sys.glob('*_chromosomes.fasta.gz')  # Get list of chromosomes
+
+# Read primer information from a file and perform in silico PCR for each primer set
+read_delim('primers_triticum.txt', delim = ' ', col_names = c('name', 'f', 'r', 'len')) %>%
+  group_by(f, r) %>%
+  arrange(name) %>%
+  slice(1) %>%
+  ungroup() %>%
+  distinct() %>%
+  arrange(f, r) %>%
+  select(all_of(c('name', 'f', 'r'))) %>%
+  mutate(txt = glue::glue(">{name}_f\n{f}\n>{name}_r\n{r}")) %>%
+  select(all_of(c('name', 'txt'))) %>%
+  furrr::future_pwalk(in_silico_pcr)  # Perform in silico PCR in parallel
